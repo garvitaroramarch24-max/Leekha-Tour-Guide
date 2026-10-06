@@ -92,6 +92,155 @@ test('health and public package list use the backend service', async () => {
   });
 });
 
+test('AI trip suggestions only return catalog packages within the submitted budget', async () => {
+  let geminiRequest;
+  const app = createApp({
+    adminClient: createMockSupabase({
+      packages: [
+        { id: 1, name: 'Budget Shimla', destination: 'Shimla', budget: 8500, days: '3 days', highlights: 'Mountain views', type: 'Hill Station' },
+        { id: 2, name: 'Luxury Goa', destination: 'Goa', budget: 22000, days: '5 days', highlights: 'Beach resort', type: 'Beach' },
+      ],
+    }),
+    authClientFactory: () => ({ auth: { signInWithPassword: async () => ({ data: {}, error: null }) } }),
+    env: { FRONTEND_ORIGIN: 'http://localhost:5173', GEMINI_API_KEY: 'test-key' },
+    fetchImpl: async (url, options) => {
+      geminiRequest = { url, headers: options.headers, body: JSON.parse(options.body) };
+      return {
+        ok: true,
+        json: async () => ({
+          candidates: [{
+            content: {
+              parts: [{
+                text: JSON.stringify({
+                  recommendations: [
+                    { id: 1, reason: 'A mountain escape within your budget.' },
+                    { id: 2, reason: 'This package is over budget.' },
+                    { id: 999, reason: 'Invented package.' },
+                    { id: 3, reason: 'Another option.' },
+                    { id: 4, reason: 'Too many options.' },
+                  ],
+                }),
+              }],
+            },
+          }],
+        }),
+      };
+    },
+  });
+
+  await withServer(app, async (baseUrl) => {
+    const response = await fetch(`${baseUrl}/api/trip-suggestions`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ budget: 10000 }),
+    });
+    assert.equal(response.status, 200);
+    const { recommendations } = await response.json();
+    assert.equal(recommendations.length, 1);
+    assert.equal(recommendations[0].id, 1);
+    assert.equal(recommendations[0].name, 'Budget Shimla');
+    assert.equal(recommendations[0].reason, 'A mountain escape within your budget.');
+    assert.match(geminiRequest.url, /models\/gemini-3\.1-flash-lite:generateContent/);
+    assert.doesNotMatch(geminiRequest.url, /test-key/);
+    assert.equal(geminiRequest.headers['x-goog-api-key'], 'test-key');
+    assert.match(geminiRequest.body.contents[0].parts[0].text, /Budget Shimla/);
+    assert.doesNotMatch(geminiRequest.body.contents[0].parts[0].text, /Luxury Goa/);
+  });
+});
+
+test('AI trip suggestions return no more than three package options', async () => {
+  const packages = [1, 2, 3, 4].map((id) => ({
+    id,
+    name: `Trip ${id}`,
+    destination: `Place ${id}`,
+    budget: 5000,
+    days: '2 days',
+    highlights: '',
+    type: 'Other',
+  }));
+  const app = createApp({
+    adminClient: createMockSupabase({ packages }),
+    authClientFactory: () => ({ auth: { signInWithPassword: async () => ({ data: {}, error: null }) } }),
+    env: { FRONTEND_ORIGIN: 'http://localhost:5173', GEMINI_API_KEY: 'test-key' },
+    fetchImpl: async () => ({
+      ok: true,
+      json: async () => ({
+        candidates: [{
+          content: {
+            parts: [{
+              text: JSON.stringify({
+                recommendations: packages.map(({ id }) => ({ id, reason: `Option ${id}` })),
+              }),
+            }],
+          },
+        }],
+      }),
+    }),
+  });
+
+  await withServer(app, async (baseUrl) => {
+    const response = await fetch(`${baseUrl}/api/trip-suggestions`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ budget: 10000 }),
+    });
+    assert.equal(response.status, 200);
+    const { recommendations } = await response.json();
+    assert.equal(recommendations.length, 3);
+  });
+});
+
+test('AI trip suggestions reject invalid budgets and report a missing API key', async () => {
+  const app = createApp({
+    adminClient: createMockSupabase(),
+    authClientFactory: () => ({ auth: { signInWithPassword: async () => ({ data: {}, error: null }) } }),
+    env: { FRONTEND_ORIGIN: 'http://localhost:5173' },
+  });
+
+  await withServer(app, async (baseUrl) => {
+    const invalid = await fetch(`${baseUrl}/api/trip-suggestions`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ budget: -5 }),
+    });
+    assert.equal(invalid.status, 400);
+
+    const unconfigured = await fetch(`${baseUrl}/api/trip-suggestions`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ budget: 10000 }),
+    });
+    assert.equal(unconfigured.status, 503);
+    assert.match((await unconfigured.json()).error, /not configured/i);
+  });
+});
+
+test('AI trip suggestions report Gemini quota and access failures clearly', async () => {
+  for (const [providerStatus, expectedMessage] of [
+    [403, /API key restrictions/],
+    [429, /quota or rate limit/],
+  ]) {
+    const app = createApp({
+      adminClient: createMockSupabase({
+        packages: [{ id: 1, name: 'Shimla', destination: 'Shimla', budget: 8500 }],
+      }),
+      authClientFactory: () => ({ auth: { signInWithPassword: async () => ({ data: {}, error: null }) } }),
+      env: { FRONTEND_ORIGIN: 'http://localhost:5173', GEMINI_API_KEY: 'test-key' },
+      fetchImpl: async () => ({ ok: false, status: providerStatus }),
+    });
+
+    await withServer(app, async (baseUrl) => {
+      const response = await fetch(`${baseUrl}/api/trip-suggestions`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ budget: 10000 }),
+      });
+      assert.equal(response.status, 502);
+      assert.match((await response.json()).error, expectedMessage);
+    });
+  }
+});
+
 test('trip inquiries email the configured recipient and reject invalid submissions', async () => {
   let sentEmail;
   const app = createApp({

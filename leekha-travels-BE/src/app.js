@@ -31,9 +31,16 @@ function createUploadMiddleware() {
   });
 }
 
-export function createApp({ adminClient, authClientFactory, env = process.env, sendInquiryEmail }) {
+export function createApp({
+  adminClient,
+  authClientFactory,
+  env = process.env,
+  sendInquiryEmail,
+  fetchImpl = globalThis.fetch,
+}) {
   const app = express();
   const bucket = env.SUPABASE_STORAGE_BUCKET || 'travel-photos';
+  const geminiModel = env.GEMINI_MODEL || 'gemini-3.1-flash-lite';
   const emailConfigured = Boolean(env.GMAIL_USER && env.GMAIL_APP_PASSWORD && env.INQUIRY_TO_EMAIL);
   const transporter = emailConfigured
     ? nodemailer.createTransport({
@@ -85,6 +92,110 @@ export function createApp({ adminClient, authClientFactory, env = process.env, s
     if (error) return next(error);
     res.json(data);
   });
+
+  app.post(
+    '/api/trip-suggestions',
+    rateLimit({ windowMs: 15 * 60 * 1000, limit: 10, standardHeaders: 'draft-8', legacyHeaders: false }),
+    async (req, res, next) => {
+      const budget = Number(req.body?.budget);
+      if (!Number.isSafeInteger(budget) || budget < 1 || budget > 10000000) {
+        return res.status(400).json({ error: 'Enter a valid budget between ₹1 and ₹1,00,00,000.' });
+      }
+      if (!env.GEMINI_API_KEY) {
+        return res.status(503).json({ error: 'AI trip suggestions are not configured yet. Please try again later.' });
+      }
+
+      const { data: packages, error } = await adminClient
+        .from('packages')
+        .select(packageColumns)
+        .order('id', { ascending: true });
+      if (error) return next(error);
+
+      const affordablePackages = packages.filter((pkg) => Number(pkg.budget) <= budget);
+      if (affordablePackages.length === 0) {
+        return res.json({ recommendations: [] });
+      }
+
+      const catalog = affordablePackages.map(({ id, name, destination, budget: price, days, highlights, type }) => ({
+        id,
+        name,
+        destination,
+        price,
+        days,
+        highlights,
+        type,
+      }));
+      const prompt = [
+        `The visitor's maximum package budget is INR ${budget}.`,
+        'Recommend up to 3 distinct packages from this catalog only. These are alternative options, not a combined itinerary. Do not invent packages, destinations, prices, or features.',
+        'Choose a useful mix of trips that fit the budget. Give each recommendation one short reason based only on its catalog details.',
+        'Return JSON only in this exact shape: {"recommendations":[{"id":1,"reason":"..."}]}.',
+        `Catalog: ${JSON.stringify(catalog)}`,
+      ].join('\n');
+
+      try {
+        const response = await fetchImpl(
+          `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(geminiModel)}:generateContent`,
+          {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'x-goog-api-key': env.GEMINI_API_KEY,
+            },
+            body: JSON.stringify({
+              systemInstruction: {
+                parts: [{ text: 'You are a travel package recommendation assistant. Follow the user prompt and output only the requested JSON.' }],
+              },
+              contents: [{ parts: [{ text: prompt }] }],
+              generationConfig: { responseMimeType: 'application/json', temperature: 0.2 },
+            }),
+            signal: AbortSignal.timeout(15000),
+          }
+        );
+
+        if (!response.ok) {
+          console.error(`Gemini trip suggestion request failed with status ${response.status}.`);
+          const messageByStatus = {
+            400: 'Gemini rejected the request. Check that the API key is valid and the selected model is enabled.',
+            401: 'Gemini rejected the API key. Check the GEMINI_API_KEY value on the backend.',
+            403: 'Gemini denied access. Check the API key restrictions and that the Gemini API is enabled for its project.',
+            404: 'The configured Gemini model was not found. Check GEMINI_MODEL on the backend.',
+            429: 'Gemini’s free-tier quota or rate limit has been reached. Please wait and try again later.',
+          };
+          return res.status(502).json({
+            error: messageByStatus[response.status] || 'Gemini is temporarily unavailable. Please try again later.',
+          });
+        }
+
+        const result = await response.json();
+        const generatedText = result.candidates?.[0]?.content?.parts
+          ?.map((part) => part.text ?? '')
+          .join('');
+        if (!generatedText) {
+          console.error('Gemini returned no trip suggestion content.');
+          return res.status(502).json({ error: 'AI could not suggest trips right now. Please try again later.' });
+        }
+
+        const generated = JSON.parse(generatedText);
+        const packageById = new Map(affordablePackages.map((pkg) => [String(pkg.id), pkg]));
+        const seenIds = new Set();
+        const recommendations = (Array.isArray(generated.recommendations) ? generated.recommendations : [])
+          .slice(0, 3)
+          .flatMap(({ id, reason }) => {
+            const packageId = String(id);
+            const pkg = packageById.get(packageId);
+            if (!pkg || seenIds.has(packageId) || typeof reason !== 'string' || !reason.trim()) return [];
+            seenIds.add(packageId);
+            return [{ ...pkg, reason: reason.trim().slice(0, 280) }];
+          });
+
+        return res.json({ recommendations });
+      } catch (suggestionError) {
+        console.error('Could not generate AI trip suggestions:', suggestionError.message);
+        return res.status(502).json({ error: 'AI trip suggestions are temporarily unavailable. Please try again later.' });
+      }
+    }
+  );
 
   app.post(
     '/api/inquiries',
